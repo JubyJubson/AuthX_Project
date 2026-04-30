@@ -1,42 +1,58 @@
 """
-Fisierul principal al aplicatiei Flask. Aici am facut toata logica de rute si autentificare.
-Am lasat intentionat vulnerabilitatile pentru faza MVP a proiectului ca sa le pot demonstra la audit.
-De exemplu, hash-ul pentru parole este MD5 (foarte slab), iar la login dau erori diferite daca utilizatorul exista sau nu.
-Sesiunea este tinuta printr-un cookie simplu in browser unde stochez direct ID-ul utilizatorului, ceea ce e super usor de modificat.
-La partea de tichete nu am pus verificare pe backend la stergere, deci teoretic oricine poate sterge tichetul oricui din greseala sau intentionat.
-Token-ul de resetare parola e format doar dintr-un string concatenat cu emailul ca sa nu ma complic cu librarii de criptare acum.
+Aici este versiunea finala si securizata a proiectului meu. Dupa ce am testat atacurile pe V1, am implementat fix-urile.
+In primul rand, am renuntat complet la MD5 si la hash-ul creat manual, folosind acum libraria Flask-Bcrypt,
+asa cum e standard in industrie, pentru un hashing puternic cu salt automat.
+Pentru sesiuni nu mai las cookie-urile in clar. Am activat sesiunile native din Flask (semnate cu secret_key)
+si am pus flag-urile de securitate HttpOnly si SameSite pe cookie ca sa previn XSS/CSRF.
+La login am pus mesaje generice ca sa previn enumerarea utilizatorilor si am adaugat un mecanism de blocare a contului
+dupa 3 incercari gresite pentru a respinge atacurile de tip Brute Force.
+La partea de tichete (CRUD) am reparat IDOR-ul: acum backend-ul verifica strict daca tichetul pe care vrei sa il stergi iti apartine tie.
+De asemenea am implementat o bara de cautare sigura (folosind query parametrizat prin ORM ca sa evit SQL Injection)
+si am pus un handler pentru eroarea 500 ca sa nu afisez niciodata stack trace-ul aplicatiei daca pica ceva intern.
 """
 
-from flask import Flask, request, render_template, redirect, url_for, make_response
+from flask import Flask, request, render_template, redirect, url_for, session, abort
+from flask_bcrypt import Bcrypt
+from itsdangerous import URLSafeTimedSerializer, SignatureExpired
 from models import baza_date, Utilizator, LogAudit, Tichet
-import hashlib
+import os
+from datetime import timedelta
 
 aplicatie = Flask(__name__)
 aplicatie.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///authx.db'
 aplicatie.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
+aplicatie.secret_key = os.urandom(24)
+aplicatie.config['PERMANENT_SESSION_LIFETIME'] = timedelta(minutes=30)
+aplicatie.config['SESSION_COOKIE_HTTPONLY'] = True
+aplicatie.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
+
 baza_date.init_app(aplicatie)
+criptare_parole = Bcrypt(aplicatie)
+generator_token_sigur = URLSafeTimedSerializer(aplicatie.secret_key)
 
 with aplicatie.app_context():
     baza_date.create_all()
 
 
-def generare_hash_simplu(text_parola):
-    rezultat_hash = hashlib.md5(text_parola.encode()).hexdigest()
-    return rezultat_hash
+def necesita_autentificare(functie_originala):
+    def functie_imbracata(*args, **kwargs):
+        if 'id_sesiune' not in session:
+            return redirect(url_for('pagina_login'))
+        return functie_originala(*args, **kwargs)
+
+    functie_imbracata.__name__ = functie_originala.__name__
+    return functie_imbracata
 
 
 @aplicatie.route('/')
+@necesita_autentificare
 def pagina_principala():
-    cookie_sesiune = request.cookies.get('user_session')
+    id_utilizator_logat = session['id_sesiune']
+    utilizator_curent = baza_date.session.get(Utilizator, id_utilizator_logat)
+    lista_tichetele_mele = Tichet.query.filter_by(id_proprietar=id_utilizator_logat).all()
 
-    if cookie_sesiune:
-        utilizator_logat = baza_date.session.get(Utilizator, int(cookie_sesiune))
-        if utilizator_logat:
-            lista_toate_tichetele = Tichet.query.all()
-            return render_template('dashboard.html', user=utilizator_logat, tickets=lista_toate_tichetele)
-
-    return redirect(url_for('pagina_login'))
+    return render_template('dashboard.html', user=utilizator_curent, tickets=lista_tichetele_mele, search_query="")
 
 
 @aplicatie.route('/register', methods=['GET', 'POST'])
@@ -45,12 +61,15 @@ def pagina_inregistrare():
         email_introdus = request.form['email']
         parola_introdusa = request.form['password']
 
+        if len(parola_introdusa) < 8:
+            return render_template('register.html', error="Password must be at least 8 characters long!")
+
         verificare_existenta = Utilizator.query.filter_by(email=email_introdus).first()
         if verificare_existenta:
             return render_template('register.html', error="Email is already registered!")
 
-        parola_codata = generare_hash_simplu(parola_introdusa)
-        utilizator_nou = Utilizator(email=email_introdus, parola_hash=parola_codata)
+        parola_securizata = criptare_parole.generate_password_hash(parola_introdusa).decode('utf-8')
+        utilizator_nou = Utilizator(email=email_introdus, parola_hash=parola_securizata)
 
         baza_date.session.add(utilizator_nou)
         baza_date.session.commit()
@@ -65,47 +84,51 @@ def pagina_login():
     if request.method == 'POST':
         email_formular = request.form['email']
         parola_formular = request.form['password']
+        eroare_generica = "Invalid email or password!"
 
         utilizator_gasit = Utilizator.query.filter_by(email=email_formular).first()
 
         if not utilizator_gasit:
-            return render_template('login.html', error="User does not exist in the database!")
+            return render_template('login.html', error=eroare_generica)
 
-        hash_parola_curenta = generare_hash_simplu(parola_formular)
+        if utilizator_gasit.locked:
+            return render_template('login.html', error="Account locked due to too many failed attempts.")
 
-        if utilizator_gasit.parola_hash != hash_parola_curenta:
-            return render_template('login.html', error="Incorrect password for this user!")
+        if not criptare_parole.check_password_hash(utilizator_gasit.parola_hash, parola_formular):
+            utilizator_gasit.failed_login_attempts += 1
+            if utilizator_gasit.failed_login_attempts >= 3:
+                utilizator_gasit.locked = True
+            baza_date.session.commit()
+            return render_template('login.html', error=eroare_generica)
 
-        inregistrare_log = LogAudit(
+        utilizator_gasit.failed_login_attempts = 0
+        inregistrare_succes = LogAudit(
             id_utilizator=utilizator_gasit.id,
-            actiune_facuta="LOGIN_ATTEMPT",
-            resursa_afectata="Sistem",
+            actiune_facuta="LOGIN_SUCCESS",
             adresa_ip=request.remote_addr
         )
-        baza_date.session.add(inregistrare_log)
+        baza_date.session.add(inregistrare_succes)
         baza_date.session.commit()
 
-        raspuns_server = make_response(redirect(url_for('pagina_principala')))
-        raspuns_server.set_cookie('user_session', str(utilizator_gasit.id))
-
-        return raspuns_server
+        session.permanent = True
+        session['id_sesiune'] = utilizator_gasit.id
+        return redirect(url_for('pagina_principala'))
 
     return render_template('login.html')
 
 
 @aplicatie.route('/ticket/add', methods=['POST'])
+@necesita_autentificare
 def adaugare_tichet():
-    id_sesiune_curenta = request.cookies.get('user_session')
-
     titlu_formular = request.form['title']
     descriere_formular = request.form['description']
+    id_utilizator_logat = session['id_sesiune']
 
     tichet_nou_creat = Tichet(
         titlu_tichet=titlu_formular,
         descriere_tichet=descriere_formular,
-        id_proprietar=int(id_sesiune_curenta)
+        id_proprietar=id_utilizator_logat
     )
-
     baza_date.session.add(tichet_nou_creat)
     baza_date.session.commit()
 
@@ -113,27 +136,47 @@ def adaugare_tichet():
 
 
 @aplicatie.route('/ticket/delete/<int:id_tichet_url>', methods=['POST'])
+@necesita_autentificare
 def stergere_tichet(id_tichet_url):
     tichet_ales = baza_date.session.get(Tichet, id_tichet_url)
 
-    if tichet_ales:
-        baza_date.session.delete(tichet_ales)
-        baza_date.session.commit()
+    if not tichet_ales:
+        abort(404)
 
+    if tichet_ales.id_proprietar != session['id_sesiune']:
+        abort(403)
+
+    baza_date.session.delete(tichet_ales)
+    baza_date.session.commit()
     return redirect(url_for('pagina_principala'))
+
+
+@aplicatie.route('/search', methods=['GET'])
+@necesita_autentificare
+def cautare_tichete():
+    termen_cautat = request.args.get('q', '')
+    id_utilizator_logat = session['id_sesiune']
+    utilizator_curent = baza_date.session.get(Utilizator, id_utilizator_logat)
+
+    rezultate_cautare = Tichet.query.filter(
+        Tichet.titlu_tichet.ilike(f'%{termen_cautat}%'),
+        Tichet.id_proprietar == id_utilizator_logat
+    ).all()
+
+    return render_template('dashboard.html', user=utilizator_curent, tickets=rezultate_cautare,
+                           search_query=termen_cautat)
 
 
 @aplicatie.route('/forgot_password', methods=['GET', 'POST'])
 def pagina_uitat_parola():
     if request.method == 'POST':
         email_cautat = request.form['email']
-        utilizator_baza = Utilizator.query.filter_by(email=email_cautat).first()
+        utilizator_gasit = Utilizator.query.filter_by(email=email_cautat).first()
 
-        if utilizator_baza:
-            token_simplu = f"reset-{utilizator_baza.email}"
-            link_generat = url_for('pagina_resetare_parola', token_url=token_simplu, _external=True)
-            mesaj_afisat = f"Reset link generated: {link_generat}"
-            return render_template('forgot_password.html', msg=mesaj_afisat)
+        if utilizator_gasit:
+            token_securizat = generator_token_sigur.dumps(utilizator_gasit.email, salt='sare-resetare-parola')
+            link_generat = url_for('pagina_resetare_parola', token_url=token_securizat, _external=True)
+            return render_template('forgot_password.html', msg=f"Secure reset link: {link_generat}")
         else:
             return render_template('forgot_password.html', msg="If the email exists, a link was sent.")
 
@@ -142,18 +185,23 @@ def pagina_uitat_parola():
 
 @aplicatie.route('/reset_password/<token_url>', methods=['GET', 'POST'])
 def pagina_resetare_parola(token_url):
-    if not token_url.startswith("reset-"):
-        return "Invalid token format!", 400
+    try:
+        email_extras_din_token = generator_token_sigur.loads(token_url, salt='sare-resetare-parola', max_age=900)
+    except SignatureExpired:
+        return "The reset link has expired!", 400
+    except Exception:
+        return "Invalid or corrupted token!", 400
 
-    email_extras_din_token = token_url.replace("reset-", "")
     utilizator_gasit = Utilizator.query.filter_by(email=email_extras_din_token).first()
-
     if not utilizator_gasit:
-        return "User not found!", 404
+        return "System error!", 404
 
     if request.method == 'POST':
         parola_noua_introdusa = request.form['new_password']
-        utilizator_gasit.parola_hash = generare_hash_simplu(parola_noua_introdusa)
+        if len(parola_noua_introdusa) < 8:
+            return render_template('reset_password.html', error="Password must be at least 8 characters long!")
+
+        utilizator_gasit.parola_hash = criptare_parole.generate_password_hash(parola_noua_introdusa).decode('utf-8')
         baza_date.session.commit()
         return redirect(url_for('pagina_login'))
 
@@ -162,10 +210,14 @@ def pagina_resetare_parola(token_url):
 
 @aplicatie.route('/logout')
 def delogare_utilizator():
-    raspuns_server = make_response(redirect(url_for('pagina_login')))
-    raspuns_server.set_cookie('user_session', '', expires=0)
-    return raspuns_server
+    session.clear()
+    return redirect(url_for('pagina_login'))
+
+
+@aplicatie.errorhandler(500)
+def eroare_interna_server(eroare):
+    return "A critical internal error occurred. Our technical team has been notified.", 500
 
 
 if __name__ == '__main__':
-    aplicatie.run(debug=True)
+    aplicatie.run(debug=False)
