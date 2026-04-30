@@ -1,5 +1,7 @@
 # Proiect: AuthX - Break the Login (DASS)
 
+DEMO: https://www.youtube.com/watch?v=RE_03znNX6s
+
 Acest repository conține proiectul pentru materia **Dezvoltarea Aplicațiilor Software Securizate** (Facultatea de Matematică și Informatică, Universitatea din București). 
 
 Aplicația **AuthX** este un portal intern de ticketing dezvoltat urmărind conceptul de *Vulnerable by Design* (Construit pentru a fi atacat și apoi securizat).
