@@ -1,15 +1,15 @@
 """
-Aici am definit baza de date folosind SQLAlchemy pentru proiect.
-Am creat tabelele pentru utilizatori, tichete si loguri de audit conform cerintelor.
-Momentan la utilizatori nu am bagat reguli complexe, iar parola o sa o salvez cu un hash simplu in aplicatie.
-Pentru logurile de audit am lasat un camp de adresa ip ca sa arate mai realist in caz ca trebuie sa verificam cine a dat login.
-Nu am facut relatii foreign key foarte complicate ca sa nu ma incurc la query-uri mai tarziu.
+Pentru versiunea V2 am actualizat modelul bazei de date.
+Am adaugat coloanele 'locked' si 'failed_login_attempts' la tabelul Utilizator
+pentru a putea implementa protectia impotriva atacurilor de tip Brute Force.
+Acestea vor numara cate incercari gresite are utilizatorul si ii vor bloca temporar contul.
 """
 
 from flask_sqlalchemy import SQLAlchemy
 from datetime import datetime
 
 baza_date = SQLAlchemy()
+
 
 class Utilizator(baza_date.Model):
     __tablename__ = 'utilizatori'
@@ -18,6 +18,11 @@ class Utilizator(baza_date.Model):
     parola_hash = baza_date.Column(baza_date.String(255), nullable=False)
     rol_utilizator = baza_date.Column(baza_date.String(20), default='USER')
     data_creare = baza_date.Column(baza_date.DateTime, default=datetime.utcnow)
+
+    # Campuri adaugate pentru securitatea anti Brute-Force
+    locked = baza_date.Column(baza_date.Boolean, default=False)
+    failed_login_attempts = baza_date.Column(baza_date.Integer, default=0)
+
 
 class Tichet(baza_date.Model):
     __tablename__ = 'tichete'
@@ -28,6 +33,7 @@ class Tichet(baza_date.Model):
     status_curent = baza_date.Column(baza_date.String(20), default='OPEN')
     id_proprietar = baza_date.Column(baza_date.Integer, baza_date.ForeignKey('utilizatori.id'), nullable=False)
     data_adaugare = baza_date.Column(baza_date.DateTime, default=datetime.utcnow)
+
 
 class LogAudit(baza_date.Model):
     __tablename__ = 'loguri_audit'
