@@ -1,5 +1,10 @@
+<!--
+Acesta este template-ul pentru pagina de autentificare.
+Am folosit Bootstrap 5 importat prin CDN ca sa arate profesionist fara efort prea mare la CSS.
+Formularul trimite datele cu metoda POST. Daca apar erori de validare din app.py, le afisez deasupra formularului cu rosu.
+-->
 <!DOCTYPE html>
-<html lang="ro">
+<html lang="en">
 <head>
     <meta charset="UTF-8">
     <title>AuthX - Login</title>
@@ -11,27 +16,26 @@
         <div class="col-md-5">
             <div class="card shadow">
                 <div class="card-header bg-dark text-white text-center">
-                    <h4>Autentificare AuthX</h4>
+                    <h4>AuthX Authentication</h4>
                 </div>
                 <div class="card-body">
-                    <!-- AICI SE VEDE VULNERABILITATEA DE USER ENUMERATION -->
                     {% if error %}
                         <div class="alert alert-danger">{{ error }}</div>
                     {% endif %}
-                    <form method="POST" action="/login">
+                    <form method="POST">
                         <div class="mb-3">
-                            <label>Email</label>
+                            <label>Email Address</label>
                             <input type="email" name="email" class="form-control" required>
                         </div>
                         <div class="mb-3">
-                            <label>Parolă</label>
+                            <label>Password</label>
                             <input type="password" name="password" class="form-control" required>
                         </div>
-                        <button type="submit" class="btn btn-dark w-100">Intră în cont</button>
+                        <button type="submit" class="btn btn-dark w-100">Sign In</button>
                     </form>
                     <div class="mt-3 text-center">
-                        <a href="/register">Nu ai cont? Creează unul.</a>
-                        <a href="/forgot_password" class="text-danger">Ai uitat parola?</a>
+                        <a href="/register">Don't have an account? Register here.</a><br>
+                        <a href="/forgot_password" class="text-danger">Forgot Password?</a>
                     </div>
                 </div>
             </div>

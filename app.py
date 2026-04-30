@@ -1,198 +1,171 @@
-from flask import Flask, request, render_template, redirect, url_for, session, flash, abort
-from flask_bcrypt import Bcrypt
-from itsdangerous import URLSafeTimedSerializer, SignatureExpired
-from models import db, User, AuditLog, Ticket
-from datetime import timedelta
-import os
+"""
+Fisierul principal al aplicatiei Flask. Aici am facut toata logica de rute si autentificare.
+Am lasat intentionat vulnerabilitatile pentru faza MVP a proiectului ca sa le pot demonstra la audit.
+De exemplu, hash-ul pentru parole este MD5 (foarte slab), iar la login dau erori diferite daca utilizatorul exista sau nu.
+Sesiunea este tinuta printr-un cookie simplu in browser unde stochez direct ID-ul utilizatorului, ceea ce e super usor de modificat.
+La partea de tichete nu am pus verificare pe backend la stergere, deci teoretic oricine poate sterge tichetul oricui din greseala sau intentionat.
+Token-ul de resetare parola e format doar dintr-un string concatenat cu emailul ca sa nu ma complic cu librarii de criptare acum.
+"""
 
-app = Flask(__name__)
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///authx.db'
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-app.secret_key = os.urandom(24)
-app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(minutes=30)
-app.config['SESSION_COOKIE_SECURE'] = False  # True in productie HTTPS
-app.config['SESSION_COOKIE_HTTPONLY'] = True
-app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
+from flask import Flask, request, render_template, redirect, url_for, make_response
+from models import baza_date, Utilizator, LogAudit, Tichet
+import hashlib
 
-db.init_app(app)
-bcrypt = Bcrypt(app)  # BAREM: Folosire Bcrypt pentru hash parole
-s = URLSafeTimedSerializer(app.secret_key)
+aplicatie = Flask(__name__)
+aplicatie.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///authx.db'
+aplicatie.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
-with app.app_context():
-    db.create_all()
+baza_date.init_app(aplicatie)
 
-
-# Helper pentru a bloca accesul neautorizat la pagini
-def login_required(f):
-    def wrap(*args, **kwargs):
-        if 'user_id' not in session:
-            return redirect(url_for('login'))
-        return f(*args, **kwargs)
-
-    wrap.__name__ = f.__name__
-    return wrap
+with aplicatie.app_context():
+    baza_date.create_all()
 
 
-# ==========================================
-# RUTARE AUTH (Login, Register, Reset)
-# ==========================================
-@app.route('/register', methods=['GET', 'POST'])
-def register():
+def generare_hash_simplu(text_parola):
+    rezultat_hash = hashlib.md5(text_parola.encode()).hexdigest()
+    return rezultat_hash
+
+
+@aplicatie.route('/')
+def pagina_principala():
+    cookie_sesiune = request.cookies.get('user_session')
+
+    if cookie_sesiune:
+        utilizator_logat = baza_date.session.get(Utilizator, int(cookie_sesiune))
+        if utilizator_logat:
+            lista_toate_tichetele = Tichet.query.all()
+            return render_template('dashboard.html', user=utilizator_logat, tickets=lista_toate_tichetele)
+
+    return redirect(url_for('pagina_login'))
+
+
+@aplicatie.route('/register', methods=['GET', 'POST'])
+def pagina_inregistrare():
     if request.method == 'POST':
-        email = request.form['email']
-        password = request.form['password']
+        email_introdus = request.form['email']
+        parola_introdusa = request.form['password']
 
-        if len(password) < 8:
-            return render_template('register.html', error="Parola trebuie să aibă minim 8 caractere!")
+        verificare_existenta = Utilizator.query.filter_by(email=email_introdus).first()
+        if verificare_existenta:
+            return render_template('register.html', error="Email is already registered!")
 
-        if User.query.filter_by(email=email).first():
-            return render_template('register.html', error="Email-ul există deja!")
+        parola_codata = generare_hash_simplu(parola_introdusa)
+        utilizator_nou = Utilizator(email=email_introdus, parola_hash=parola_codata)
 
-        # Hash modern folosind Bcrypt (Cerință Barem)
-        hashed_pw = bcrypt.generate_password_hash(password).decode('utf-8')
-        new_user = User(email=email, password_hash=hashed_pw)
-        db.session.add(new_user)
-        db.session.commit()
-        return redirect(url_for('login'))
+        baza_date.session.add(utilizator_nou)
+        baza_date.session.commit()
+
+        return redirect(url_for('pagina_login'))
 
     return render_template('register.html')
 
 
-@app.route('/login', methods=['GET', 'POST'])
-def login():
+@aplicatie.route('/login', methods=['GET', 'POST'])
+def pagina_login():
     if request.method == 'POST':
-        email = request.form['email']
-        password = request.form['password']
-        user = User.query.filter_by(email=email).first()
+        email_formular = request.form['email']
+        parola_formular = request.form['password']
 
-        generic_error = "Email sau parolă incorectă!"
-        if not user:
-            return render_template('login.html', error=generic_error)
+        utilizator_gasit = Utilizator.query.filter_by(email=email_formular).first()
 
-        if user.locked:
-            return render_template('login.html', error="Cont blocat. Prea multe încercări.")
+        if not utilizator_gasit:
+            return render_template('login.html', error="User does not exist in the database!")
 
-        if not bcrypt.check_password_hash(user.password_hash, password):
-            user.failed_login_attempts += 1
-            if user.failed_login_attempts >= 3:
-                user.locked = True
-            db.session.commit()
-            return render_template('login.html', error=generic_error)
+        hash_parola_curenta = generare_hash_simplu(parola_formular)
 
-        audit = AuditLog(user_id=user.id, action="LOGIN_SUCCESS", resource="auth", ip_address=request.remote_addr)
-        user.failed_login_attempts = 0
-        db.session.add(audit)
-        db.session.commit()
+        if utilizator_gasit.parola_hash != hash_parola_curenta:
+            return render_template('login.html', error="Incorrect password for this user!")
 
-        session.permanent = True
-        session['user_id'] = user.id
-        return redirect(url_for('index'))
+        inregistrare_log = LogAudit(
+            id_utilizator=utilizator_gasit.id,
+            actiune_facuta="LOGIN_ATTEMPT",
+            resursa_afectata="Sistem",
+            adresa_ip=request.remote_addr
+        )
+        baza_date.session.add(inregistrare_log)
+        baza_date.session.commit()
+
+        raspuns_server = make_response(redirect(url_for('pagina_principala')))
+        raspuns_server.set_cookie('user_session', str(utilizator_gasit.id))
+
+        return raspuns_server
 
     return render_template('login.html')
 
 
-@app.route('/logout')
-def logout():
-    session.clear()
-    return redirect(url_for('login'))
+@aplicatie.route('/ticket/add', methods=['POST'])
+def adaugare_tichet():
+    id_sesiune_curenta = request.cookies.get('user_session')
+
+    titlu_formular = request.form['title']
+    descriere_formular = request.form['description']
+
+    tichet_nou_creat = Tichet(
+        titlu_tichet=titlu_formular,
+        descriere_tichet=descriere_formular,
+        id_proprietar=int(id_sesiune_curenta)
+    )
+
+    baza_date.session.add(tichet_nou_creat)
+    baza_date.session.commit()
+
+    return redirect(url_for('pagina_principala'))
 
 
-@app.route('/forgot_password', methods=['GET', 'POST'])
-def forgot_password():
+@aplicatie.route('/ticket/delete/<int:id_tichet_url>', methods=['POST'])
+def stergere_tichet(id_tichet_url):
+    tichet_ales = baza_date.session.get(Tichet, id_tichet_url)
+
+    if tichet_ales:
+        baza_date.session.delete(tichet_ales)
+        baza_date.session.commit()
+
+    return redirect(url_for('pagina_principala'))
+
+
+@aplicatie.route('/forgot_password', methods=['GET', 'POST'])
+def pagina_uitat_parola():
     if request.method == 'POST':
-        user = User.query.filter_by(email=request.form['email']).first()
-        if user:
-            token = s.dumps(user.email, salt='reset-salt')
-            reset_link = url_for('reset_password', token=token, _external=True)
-            return render_template('forgot_password.html', msg=f"Link generat: {reset_link}")
-        return render_template('forgot_password.html', msg="Dacă email-ul există, s-a trimis un link.")
+        email_cautat = request.form['email']
+        utilizator_baza = Utilizator.query.filter_by(email=email_cautat).first()
+
+        if utilizator_baza:
+            token_simplu = f"reset-{utilizator_baza.email}"
+            link_generat = url_for('pagina_resetare_parola', token_url=token_simplu, _external=True)
+            mesaj_afisat = f"Reset link generated: {link_generat}"
+            return render_template('forgot_password.html', msg=mesaj_afisat)
+        else:
+            return render_template('forgot_password.html', msg="If the email exists, a link was sent.")
+
     return render_template('forgot_password.html')
 
 
-@app.route('/reset_password/<token>', methods=['GET', 'POST'])
-def reset_password(token):
-    try:
-        email = s.loads(token, salt='reset-salt', max_age=900)
-    except:
-        return "Link invalid sau expirat!", 400
+@aplicatie.route('/reset_password/<token_url>', methods=['GET', 'POST'])
+def pagina_resetare_parola(token_url):
+    if not token_url.startswith("reset-"):
+        return "Invalid token format!", 400
+
+    email_extras_din_token = token_url.replace("reset-", "")
+    utilizator_gasit = Utilizator.query.filter_by(email=email_extras_din_token).first()
+
+    if not utilizator_gasit:
+        return "User not found!", 404
 
     if request.method == 'POST':
-        new_password = request.form['new_password']
-        if len(new_password) < 8:
-            return render_template('reset_password.html', error="Minim 8 caractere!")
-        user = User.query.filter_by(email=email).first()
-        user.password_hash = bcrypt.generate_password_hash(new_password).decode('utf-8')
-        db.session.commit()
-        return redirect(url_for('login'))
+        parola_noua_introdusa = request.form['new_password']
+        utilizator_gasit.parola_hash = generare_hash_simplu(parola_noua_introdusa)
+        baza_date.session.commit()
+        return redirect(url_for('pagina_login'))
+
     return render_template('reset_password.html')
 
 
-# ==========================================
-# RUTARE TICHETE (CRUD + Search + IDOR Fix)
-# ==========================================
-@app.route('/')
-@login_required
-def index():
-    user = db.session.get(User, session['user_id'])
-    # BAREM: Query parametrizat generat nativ de SQLAlchemy (Prevenire SQLi)
-    # Afisam DOAR tichetele userului curent
-    tickets = Ticket.query.filter_by(owner_id=user.id).all()
-    return render_template('dashboard.html', user=user, tickets=tickets)
-
-
-@app.route('/ticket/add', methods=['POST'])
-@login_required
-def add_ticket():
-    title = request.form['title']
-    description = request.form['description']
-    new_ticket = Ticket(title=title, description=description, owner_id=session['user_id'])
-
-    # BAREM: Audit traceability
-    audit = AuditLog(user_id=session['user_id'], action="CREATE_TICKET", resource=title, ip_address=request.remote_addr)
-
-    db.session.add(new_ticket)
-    db.session.add(audit)
-    db.session.commit()
-    return redirect(url_for('index'))
-
-
-@app.route('/ticket/delete/<int:ticket_id>', methods=['POST'])
-@login_required
-def delete_ticket(ticket_id):
-    ticket = db.session.get(Ticket, ticket_id)
-    if not ticket:
-        abort(404)
-
-    # BAREM: IDOR PREVENTED! (Control acces server-side 10p)
-    # Daca comentam liniile astea 2, aplicatia e VULNERABILA la IDOR
-    if ticket.owner_id != session['user_id']:
-        abort(403)  # Forbidden - nu iti apartine!
-
-    db.session.delete(ticket)
-
-    audit = AuditLog(user_id=session['user_id'], action=f"DELETE_TICKET_{ticket_id}", resource="ticket",
-                     ip_address=request.remote_addr)
-    db.session.add(audit)
-    db.session.commit()
-
-    return redirect(url_for('index'))
-
-
-@app.route('/search', methods=['GET'])
-@login_required
-def search():
-    query = request.args.get('q', '')
-    user = db.session.get(User, session['user_id'])
-    # BAREM: Search implementat, parametrizat
-    tickets = Ticket.query.filter(Ticket.title.ilike(f'%{query}%'), Ticket.owner_id == user.id).all()
-    return render_template('dashboard.html', user=user, tickets=tickets, search_query=query)
-
-
-# BAREM: Error handling fără stack trace (5p)
-@app.errorhandler(500)
-def internal_error(error):
-    return "A apărut o eroare internă. Echipa tehnică a fost notificată.", 500
+@aplicatie.route('/logout')
+def delogare_utilizator():
+    raspuns_server = make_response(redirect(url_for('pagina_login')))
+    raspuns_server.set_cookie('user_session', '', expires=0)
+    return raspuns_server
 
 
 if __name__ == '__main__':
-    app.run(debug=False)  # Mutat pe False ca sa nu afiseze stack traces pe erori reale
+    aplicatie.run(debug=True)
